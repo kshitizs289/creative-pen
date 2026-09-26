@@ -1,0 +1,403 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <title>creative pen</title>
+  <script src="https://cdn.jsdelivr.net/npm/@mediapipe/camera_utils/camera_utils.js" crossorigin="anonymous"></script>
+  <script src="https://cdn.jsdelivr.net/npm/@mediapipe/drawing_utils/drawing_utils.js" crossorigin="anonymous"></script>
+  <script src="https://cdn.jsdelivr.net/npm/@mediapipe/hands/hands.js" crossorigin="anonymous"></script>
+  <style>
+    * { box-sizing: border-box; }
+    body { margin: 0; background: #050301; overflow: hidden; }
+    video { display: none; }
+    canvas { width: 100%; height: 100%; transform: scaleX(-1); position: absolute; z-index: 1; }
+
+    /* Shared ring base */
+    .ring-wrap {
+      position: fixed;
+      top: 50%;
+      left: 50%;
+      transform: translate(-50%, -50%);
+      z-index: 20;
+      pointer-events: none;
+      display: none;
+    }
+    .ring-wrap svg { width: 120px; height: 120px; transform: rotate(-90deg); }
+    .ring-wrap circle.track { fill: none; stroke-width: 4; }
+    .ring-wrap circle.progress { fill: none; stroke-width: 4; stroke-linecap: round; stroke-dasharray: 283; stroke-dashoffset: 283; }
+    .ring-label {
+      position: absolute; inset: 0;
+      display: flex; align-items: center; justify-content: center;
+      font-size: 13px; font-family: monospace;
+      letter-spacing: 0.1em; text-transform: uppercase;
+    }
+
+    /* Fist ring — gold */
+    #fist-ring circle.track    { stroke: rgba(245,208,97,0.15); }
+    #fist-ring circle.progress { stroke: #F5D061; filter: drop-shadow(0 0 8px #F5D061); }
+    #fist-ring .ring-label     { color: #F5D061; text-shadow: 0 0 10px #F5D061; }
+
+    /* Undo ring — red-orange */
+    #undo-ring circle.track    { stroke: rgba(255,100,80,0.15); }
+    #undo-ring circle.progress { stroke: #FF6450; filter: drop-shadow(0 0 8px #FF6450); }
+    #undo-ring .ring-label     { color: #FF6450; text-shadow: 0 0 10px #FF6450; }
+
+    /* Flash */
+    #flash {
+      position: fixed; inset: 0; z-index: 30;
+      pointer-events: none; opacity: 0;
+      transition: opacity 0.2s;
+    }
+  </style>
+</head>
+<body>
+  <video id="vid"></video>
+  <canvas id="c"></canvas>
+
+  <div id="fist-ring" class="ring-wrap">
+    <svg viewBox="0 0 100 100">
+      <circle class="track"    cx="50" cy="50" r="45"/>
+      <circle class="progress" id="fist-arc" cx="50" cy="50" r="45"/>
+    </svg>
+    <div class="ring-label" id="fist-label">Hold…</div>
+  </div>
+
+  <div id="undo-ring" class="ring-wrap">
+    <svg viewBox="0 0 100 100">
+      <circle class="track"    cx="50" cy="50" r="45"/>
+      <circle class="progress" id="undo-arc" cx="50" cy="50" r="45"/>
+    </svg>
+    <div class="ring-label" id="undo-label">Undo</div>
+  </div>
+
+  <div id="flash"></div>
+
+  <script>
+    var vid = document.getElementById('vid');
+    var c   = document.getElementById('c');
+    var ctx = c.getContext('2d');
+
+    // ── Strokes & offscreen ──────────────────────────────────────
+    var strokes   = [];
+    var curStroke = null;
+    var offCanvas = null, offCtx = null;
+
+    // ── Smoothed cursors ─────────────────────────────────────────
+    var sx = null, sy = null;           // index tip (draw cursor)
+    var px = null, py = null;           // pinch midpoint (pan anchor)
+    var FINGER_SMOOTH = 0.35;
+    var PINCH_SMOOTH  = 0.25;
+
+    // ── Pan state ────────────────────────────────────────────────
+    var canvasOffsetX = 0, canvasOffsetY = 0;
+    var pinchAnchorCanvasX = null, pinchAnchorCanvasY = null;
+
+    // ── Mode flags ───────────────────────────────────────────────
+    var isDrawing  = false;
+    var isPinching = false;
+
+    // ── Fist clear ───────────────────────────────────────────────
+    var fistStartTime = null;
+    var FIST_HOLD_MS  = 3000;
+    var CIRC = 2 * Math.PI * 45;  // 282.7
+    var fistRing  = document.getElementById('fist-ring');
+    var fistArc   = document.getElementById('fist-arc');
+    var fistLabel = document.getElementById('fist-label');
+
+    // ── Undo (peace sign hold) ───────────────────────────────────
+    var undoStartTime  = null;
+    var UNDO_HOLD_MS   = 800;
+    var undoCooldown   = false;   // prevent repeated fires while holding
+    var undoRing  = document.getElementById('undo-ring');
+    var undoArc   = document.getElementById('undo-arc');
+    var undoLabel = document.getElementById('undo-label');
+
+    var flash = document.getElementById('flash');
+
+    // ── Offscreen ────────────────────────────────────────────────
+    function ensureOffscreen() {
+      if (!offCanvas || offCanvas.width !== c.width || offCanvas.height !== c.height) {
+        var prev = offCanvas;
+        offCanvas = document.createElement('canvas');
+        offCanvas.width  = c.width;
+        offCanvas.height = c.height;
+        offCtx = offCanvas.getContext('2d');
+        if (prev) offCtx.drawImage(prev, 0, 0);
+      }
+    }
+
+    function redrawOffscreen() {
+      ensureOffscreen();
+      offCtx.clearRect(0, 0, offCanvas.width, offCanvas.height);
+      for (var i = 0; i < strokes.length; i++) drawStroke(offCtx, strokes[i]);
+    }
+
+    function drawStroke(context, pts) {
+      if (!pts || pts.length < 2) return;
+      context.beginPath();
+      context.shadowColor = '#F5D061';
+      context.shadowBlur  = 15;
+      context.strokeStyle = '#F5D061';
+      context.lineWidth   = 6;
+      context.lineCap     = 'round';
+      context.lineJoin    = 'round';
+      context.moveTo(pts[0].x, pts[0].y);
+      for (var j = 1; j < pts.length; j++) {
+        if (j < pts.length - 1) {
+          var mx = (pts[j].x + pts[j+1].x) / 2;
+          var my = (pts[j].y + pts[j+1].y) / 2;
+          context.quadraticCurveTo(pts[j].x, pts[j].y, mx, my);
+        } else {
+          context.lineTo(pts[j].x, pts[j].y);
+        }
+      }
+      context.stroke();
+    }
+
+    function doFlash(color) {
+      flash.style.background = color;
+      flash.style.opacity = '1';
+      setTimeout(function() { flash.style.opacity = '0'; }, 180);
+    }
+
+    // ── Gesture helpers ──────────────────────────────────────────
+    function dist2D(a, b) {
+      var dx = a.x - b.x, dy = a.y - b.y;
+      return Math.sqrt(dx*dx + dy*dy);
+    }
+
+    // Index up only — middle curled
+    function isIndexUp(lm) {
+      return lm[8].y < lm[6].y && lm[12].y > lm[10].y;
+    }
+
+    // Peace sign: index AND middle up, ring+pinky curled
+    function isPeaceSign(lm) {
+      return lm[8].y  < lm[6].y   &&   // index up
+             lm[12].y < lm[10].y  &&   // middle up
+             lm[16].y > lm[14].y  &&   // ring down
+             lm[20].y > lm[18].y;      // pinky down
+    }
+
+    // Pinch: thumb+index close, middle curled
+    function isPinchGesture(lm) {
+      return dist2D(lm[4], lm[8]) < 0.07 && lm[12].y > lm[10].y;
+    }
+
+    // Fist: all fingers curled
+    function isFistGesture(lm) {
+      var f = [[8,6],[12,10],[16,14],[20,18]];
+      for (var i = 0; i < f.length; i++) {
+        if (lm[f[i][0]].y < lm[f[i][1]].y) return false;
+      }
+      return dist2D(lm[4], lm[0]) < 0.25;
+    }
+
+    // ── Main loop ────────────────────────────────────────────────
+    function run(res) {
+      c.width  = window.innerWidth;
+      c.height = window.innerHeight;
+      ensureOffscreen();
+
+      ctx.drawImage(res.image, 0, 0, c.width, c.height);
+      ctx.fillStyle = 'rgba(10, 6, 2, 0.85)';
+      ctx.fillRect(0, 0, c.width, c.height);
+
+      ctx.save();
+      ctx.translate(canvasOffsetX, canvasOffsetY);
+      ctx.drawImage(offCanvas, 0, 0);
+      if (curStroke && curStroke.length > 0) drawStroke(ctx, curStroke);
+      ctx.restore();
+
+      if (res.multiHandLandmarks && res.multiHandLandmarks.length > 0) {
+        var lm = res.multiHandLandmarks[0];
+
+        drawConnectors(ctx, lm, HAND_CONNECTIONS, {color:'rgba(245,208,97,0.18)', lineWidth:1.5});
+        drawLandmarks(ctx, lm, {color:'rgba(255,255,255,0.5)', lineWidth:1, radius:2});
+
+        // Smooth index cursor
+        var rx = lm[8].x * c.width, ry = lm[8].y * c.height;
+        if (sx === null) { sx = rx; sy = ry; }
+        else { sx += (rx - sx) * FINGER_SMOOTH; sy += (ry - sy) * FINGER_SMOOTH; }
+
+        // Smooth pinch midpoint
+        var pmx = ((lm[4].x + lm[8].x) / 2) * c.width;
+        var pmy = ((lm[4].y + lm[8].y) / 2) * c.height;
+        if (px === null) { px = pmx; py = pmy; }
+        else { px += (pmx - px) * PINCH_SMOOTH; py += (pmy - py) * PINCH_SMOOTH; }
+
+        var drawMode  = isIndexUp(lm);
+        var peaceMode = isPeaceSign(lm);
+        var pinchMode = isPinchGesture(lm);
+        var fistMode  = isFistGesture(lm);
+
+        // ── FIST: hold 3s → clear all ─────────────────────────
+        if (fistMode) {
+          if (fistStartTime === null) fistStartTime = Date.now();
+          var elapsed  = Date.now() - fistStartTime;
+          var progress = Math.min(elapsed / FIST_HOLD_MS, 1);
+
+          fistRing.style.display = 'block';
+          fistArc.style.strokeDashoffset = CIRC * (1 - progress);
+          fistLabel.textContent = progress < 1 ? 'Hold…' : 'Clear!';
+
+          if (progress >= 1) {
+            strokes = []; curStroke = null;
+            canvasOffsetX = 0; canvasOffsetY = 0;
+            px = null; py = null;
+            redrawOffscreen();
+            fistStartTime = null;
+            fistRing.style.display = 'none';
+            doFlash('rgba(245,208,97,0.12)');
+          }
+
+          isDrawing = false; isPinching = false;
+          pinchAnchorCanvasX = null; pinchAnchorCanvasY = null;
+          // reset undo too
+          undoStartTime = null; undoCooldown = false;
+          undoRing.style.display = 'none';
+
+        } else {
+          if (fistStartTime !== null) {
+            fistStartTime = null;
+            fistRing.style.display = 'none';
+          }
+        }
+
+        // ── PEACE SIGN: hold 0.8s → undo last stroke ──────────
+        if (!fistMode && peaceMode) {
+          if (!undoCooldown) {
+            if (undoStartTime === null) undoStartTime = Date.now();
+            var uElapsed  = Date.now() - undoStartTime;
+            var uProgress = Math.min(uElapsed / UNDO_HOLD_MS, 1);
+
+            undoRing.style.display = 'block';
+            undoArc.style.strokeDashoffset = CIRC * (1 - uProgress);
+            undoLabel.textContent = uProgress < 1 ? 'Undo' : 'Done!';
+
+            if (uProgress >= 1) {
+              // pop last stroke
+              if (strokes.length > 0) {
+                strokes.pop();
+                redrawOffscreen();
+                doFlash('rgba(255,100,80,0.08)');
+              }
+              undoCooldown = true;
+              undoStartTime = null;
+              undoRing.style.display = 'none';
+            }
+          } else {
+            // holding after fire — keep ring hidden until they release
+            undoRing.style.display = 'none';
+          }
+
+          // no draw / pinch while peace
+          if (isDrawing && curStroke && curStroke.length > 1) {
+            strokes.push(curStroke);
+            redrawOffscreen();
+          }
+          curStroke = null; isDrawing = false;
+          isPinching = false; pinchAnchorCanvasX = null; pinchAnchorCanvasY = null;
+
+        } else {
+          // released peace — reset undo state
+          if (undoStartTime !== null || undoCooldown) {
+            undoStartTime = null;
+            undoCooldown  = false;
+            undoRing.style.display = 'none';
+          }
+        }
+
+        // ── PINCH: pan ────────────────────────────────────────
+        if (!fistMode && !peaceMode && pinchMode) {
+          if (!isPinching) {
+            isPinching = true;
+            if (curStroke && curStroke.length > 1) {
+              strokes.push(curStroke); redrawOffscreen();
+            }
+            curStroke = null; isDrawing = false;
+            pinchAnchorCanvasX = px - canvasOffsetX;
+            pinchAnchorCanvasY = py - canvasOffsetY;
+          }
+
+          canvasOffsetX = px - pinchAnchorCanvasX;
+          canvasOffsetY = py - pinchAnchorCanvasY;
+
+          ctx.beginPath();
+          ctx.arc(px, py, 12, 0, 2 * Math.PI);
+          ctx.strokeStyle = 'rgba(97,197,245,0.75)';
+          ctx.shadowColor = '#61c5f5';
+          ctx.shadowBlur  = 16;
+          ctx.lineWidth   = 2;
+          ctx.stroke();
+          ctx.shadowBlur  = 0;
+
+        } else if (!fistMode && !peaceMode) {
+          if (isPinching) {
+            isPinching = false;
+            pinchAnchorCanvasX = null; pinchAnchorCanvasY = null;
+          }
+        }
+
+        // ── INDEX UP: draw ────────────────────────────────────
+        if (!fistMode && !peaceMode && !pinchMode && drawMode) {
+          var drawX = sx - canvasOffsetX;
+          var drawY = sy - canvasOffsetY;
+
+          if (!isDrawing) {
+            isDrawing = true;
+            curStroke = [{x: drawX, y: drawY}];
+          } else {
+            curStroke.push({x: drawX, y: drawY});
+          }
+
+          ctx.beginPath();
+          ctx.arc(sx, sy, 5, 0, 2 * Math.PI);
+          ctx.fillStyle   = '#FFFFFF';
+          ctx.shadowColor = '#F5D061';
+          ctx.shadowBlur  = 12;
+          ctx.fill();
+          ctx.shadowBlur  = 0;
+
+        } else if (!pinchMode && !fistMode && !peaceMode) {
+          if (isDrawing && curStroke && curStroke.length > 1) {
+            strokes.push(curStroke);
+            redrawOffscreen();
+          }
+          curStroke = null; isDrawing = false;
+
+          ctx.beginPath();
+          ctx.arc(sx, sy, 6, 0, 2 * Math.PI);
+          ctx.fillStyle = 'rgba(245,208,97,0.3)';
+          ctx.fill();
+        }
+
+      } else {
+        if (isDrawing && curStroke && curStroke.length > 1) {
+          strokes.push(curStroke); redrawOffscreen();
+        }
+        curStroke = null; isDrawing = false; isPinching = false;
+        fistStartTime = null; fistRing.style.display = 'none';
+        undoStartTime = null; undoCooldown = false; undoRing.style.display = 'none';
+        sx = null; sy = null; px = null; py = null;
+        pinchAnchorCanvasX = null; pinchAnchorCanvasY = null;
+      }
+    }
+
+    // ── MediaPipe ─────────────────────────────────────────────────
+    var h = new Hands({
+      locateFile: (file) => `https://cdn.jsdelivr.net/npm/@mediapipe/hands/${file}`
+    });
+    h.setOptions({
+      maxNumHands: 1, modelComplexity: 1,
+      minDetectionConfidence: 0.6, minTrackingConfidence: 0.6
+    });
+    h.onResults(run);
+
+    var cam = new Camera(vid, {
+      onFrame: async () => { await h.send({image: vid}); },
+      width: 1280, height: 720
+    });
+    cam.start();
+  </script>
+</body>
+</html>
